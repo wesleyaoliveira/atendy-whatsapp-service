@@ -108,7 +108,7 @@ async function startSession(sessionId: string): Promise<void> {
         const profileName = me?.name ?? null;
         let profilePicUrl: string | null = null;
         try {
-          if (me?.id) profilePicUrl = await sock.profilePictureUrl(me.id, "image");
+          if (me?.id) profilePicUrl = await sock.profilePictureUrl(me.id, "image") ?? null;
         } catch { /* ignore */ }
 
         await updateStatus(sessionId, {
