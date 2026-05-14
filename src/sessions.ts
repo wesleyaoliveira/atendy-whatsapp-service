@@ -107,9 +107,14 @@ async function startSession(sessionId: string): Promise<void> {
         const phone = me?.id?.split("@")[0]?.split(":")[0] ?? null;
         const profileName = me?.name ?? null;
         let profilePicUrl: string | null = null;
-        try {
-          if (me?.id) profilePicUrl = await sock.profilePictureUrl(me.id, "image") ?? null;
-        } catch { /* ignore */ }
+
+try {
+  if (me?.id) {
+    profilePicUrl = (await sock.profilePictureUrl(me.id, "image")) ?? null;
+  }
+} catch {
+  /* ignore */
+}
 
         await updateStatus(sessionId, {
           status: "connected",
