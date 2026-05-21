@@ -1,3 +1,4 @@
+import { shouldIgnoreIncoming, isGroupJid, isSupportedIndividualJid } from "./filters.js";
 import { Router } from "express";
 import pino from "pino";
 import QRCode from "qrcode";
@@ -156,33 +157,113 @@ try {
     });
 
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
-      if (type !== "notify") return;
-      const out = messages.map((m) => {
-        const msg = m.message ?? {};
-        const text =
-          msg.conversation ??
-          msg.extendedTextMessage?.text ??
-          msg.imageMessage?.caption ??
-          msg.videoMessage?.caption ??
-          "";
-        const mediaType =
-          msg.imageMessage ? "image" :
-          msg.videoMessage ? "video" :
-          msg.audioMessage ? "audio" :
-          msg.documentMessage ? "document" :
-          undefined;
-        return {
-          id: m.key.id,
-          from: m.key.remoteJid,
-          fromMe: m.key.fromMe ?? false,
-          pushName: m.pushName ?? null,
-          timestamp: Number(m.messageTimestamp ?? 0),
-          text,
-          mediaType,
-        };
-      });
-      await postWebhook(s.webhookUrl, "messages.upsert", { messages: out });
+  if (type !== "notify") return;
+
+  log.info(
+    {
+      sid: sessionId,
+      count: messages?.length ?? 0,
+      type,
+    },
+    "MESSAGES_UPSERT_RECEIVED",
+  );
+
+  const out = [];
+
+  for (const m of messages ?? []) {
+    const reason = shouldIgnoreIncoming(m);
+
+    if (reason) {
+      log.info(
+        {
+          sid: sessionId,
+          reason,
+          remoteJid: m?.key?.remoteJid,
+          fromMe: m?.key?.fromMe,
+          pushName: m?.pushName,
+        },
+        reason,
+      );
+      continue;
+    }
+
+    const msg = m.message ?? {};
+
+    const text =
+      msg.conversation ??
+      msg.extendedTextMessage?.text ??
+      msg.imageMessage?.caption ??
+      msg.videoMessage?.caption ??
+      "";
+
+    const mediaType =
+      msg.imageMessage ? "image" :
+      msg.videoMessage ? "video" :
+      msg.audioMessage ? "audio" :
+      msg.documentMessage ? "document" :
+      undefined;
+
+    const remoteJid = m.key.remoteJid ?? null;
+
+    const remoteJidAlt =
+      (m.key as any)?.remoteJidAlt ??
+      (m as any)?.remoteJidAlt ??
+      null;
+
+    const senderPn =
+      (m.key as any)?.senderPn ??
+      (m.key as any)?.participantPn ??
+      (m as any)?.senderPn ??
+      null;
+
+    const participant =
+      m.key.participant ??
+      (m.key as any)?.participant ??
+      null;
+
+    const addressingMode =
+      (m.key as any)?.addressingMode ??
+      (m as any)?.addressingMode ??
+      null;
+
+    out.push({
+      id: m.key.id,
+      from: remoteJid,
+      remoteJid,
+      remoteJidAlt,
+      senderPn,
+      participant,
+      addressingMode,
+      fromMe: m.key.fromMe ?? false,
+      pushName: m.pushName ?? null,
+      timestamp: Number(m.messageTimestamp ?? 0),
+      text,
+      mediaType,
     });
+  }
+
+  if (!out.length) return;
+
+  log.info(
+    {
+      sid: sessionId,
+      webhookUrl: s.webhookUrl,
+      count: out.length,
+    },
+    "POST_WEBHOOK_ATTEMPT",
+  );
+
+  await postWebhook(s.webhookUrl, "messages.upsert", { messages: out });
+
+  log.info(
+    {
+      sid: sessionId,
+      webhookUrl: s.webhookUrl,
+      count: out.length,
+    },
+    "POST_WEBHOOK_SUCCESS",
+  );
+});
   } finally {
     s.starting = false;
   }
@@ -263,18 +344,81 @@ sessionsRouter.delete("/:id", async (req, res) => {
 sessionsRouter.post("/:id/send", async (req, res) => {
   const id = req.params.id;
   const { to, text } = req.body ?? {};
-  if (typeof to !== "string" || typeof text !== "string") {
+
+  if (typeof to !== "string" || typeof text !== "string" || !text.trim()) {
     return res.status(400).json({ error: "to and text required" });
   }
+
   const s = sessions.get(id);
+
+  log.info(
+    {
+      sid: id,
+      status: s?.status,
+      to,
+      textLength: text.length,
+    },
+    "SEND_REQUEST_RECEIVED",
+  );
+
   if (!s?.sock || s.status !== "connected") {
     return res.status(409).json({ error: "session not connected" });
   }
-  const jid = to.includes("@") ? to : `${to.replace(/\D/g, "")}@s.whatsapp.net`;
+
+  let jid = to.trim();
+
+  if (!jid.includes("@")) {
+    jid = `${jid.replace(/\D/g, "")}@s.whatsapp.net`;
+  }
+
+  if (isGroupJid(jid)) {
+    return res.status(400).json({
+      error: "Envio para grupos está desabilitado no MVP.",
+    });
+  }
+
+  if (!isSupportedIndividualJid(jid)) {
+    return res.status(400).json({
+      error: `JID não suportado no MVP: ${jid}`,
+    });
+  }
+
   try {
+    log.info(
+      {
+        sid: id,
+        jid,
+      },
+      "TO_JID",
+    );
+
     const sent = await s.sock.sendMessage(jid, { text });
-    res.json({ ok: true, id: sent?.key?.id ?? null });
+
+    log.info(
+      {
+        sid: id,
+        jid,
+        messageId: sent?.key?.id ?? null,
+      },
+      "MESSAGE_SENT",
+    );
+
+    res.json({
+      ok: true,
+      id: sent?.key?.id ?? null,
+    });
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    log.error(
+      {
+        err: e,
+        jid,
+        sid: id,
+      },
+      "SEND_ERROR",
+    );
+
+    res.status(500).json({
+      error: (e as Error).message,
+    });
   }
 });
