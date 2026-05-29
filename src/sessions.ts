@@ -422,3 +422,147 @@ sessionsRouter.post("/:id/send", async (req, res) => {
     });
   }
 });
+
+// POST /sessions/:id/send-media  { to, type, url, caption, fileName, mimetype }
+sessionsRouter.post("/:id/send-media", async (req, res) => {
+  const id = req.params.id;
+  const { to, type, url, caption, fileName, mimetype } = req.body ?? {};
+
+  if (typeof to !== "string" || typeof type !== "string" || typeof url !== "string") {
+    return res.status(400).json({
+      error: "to, type and url are required",
+    });
+  }
+
+  const s = sessions.get(id);
+
+  log.info(
+    {
+      sid: id,
+      status: s?.status,
+      to,
+      type,
+      url,
+      mimetype,
+      fileName,
+    },
+    "SEND_MEDIA_REQUEST_RECEIVED",
+  );
+
+  if (!s?.sock || s.status !== "connected") {
+    return res.status(409).json({
+      error: "session not connected",
+    });
+  }
+
+  let jid = to.trim();
+
+  if (!jid.includes("@")) {
+    jid = `${jid.replace(/\D/g, "")}@s.whatsapp.net`;
+  }
+
+  if (isGroupJid(jid)) {
+    return res.status(400).json({
+      error: "Envio para grupos está desabilitado no MVP.",
+    });
+  }
+
+  if (!isSupportedIndividualJid(jid)) {
+    return res.status(400).json({
+      error: `JID não suportado no MVP: ${jid}`,
+    });
+  }
+
+  const mediaType = type === "file" ? "document" : type;
+
+  if (!["image", "video", "audio", "document"].includes(mediaType)) {
+    return res.status(400).json({
+      error: `Tipo de mídia não suportado: ${type}`,
+    });
+  }
+
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    return res.status(400).json({
+      error: "URL da mídia precisa ser pública e começar com http ou https.",
+    });
+  }
+
+  try {
+    log.info(
+      {
+        sid: id,
+        jid,
+        mediaType,
+        url,
+      },
+      "SEND_MEDIA_ATTEMPT",
+    );
+
+    let payload: any;
+
+    if (mediaType === "image") {
+      payload = {
+        image: { url },
+        caption: caption || undefined,
+        mimetype: mimetype || "image/jpeg",
+      };
+    }
+
+    if (mediaType === "video") {
+      payload = {
+        video: { url },
+        caption: caption || undefined,
+        mimetype: mimetype || "video/mp4",
+      };
+    }
+
+    if (mediaType === "audio") {
+      payload = {
+        audio: { url },
+        mimetype: mimetype || "audio/mpeg",
+        ptt: false,
+      };
+    }
+
+    if (mediaType === "document") {
+      payload = {
+        document: { url },
+        fileName: fileName || "arquivo",
+        mimetype: mimetype || "application/octet-stream",
+        caption: caption || undefined,
+      };
+    }
+
+    const sent = await s.sock.sendMessage(jid, payload);
+
+    log.info(
+      {
+        sid: id,
+        jid,
+        mediaType,
+        messageId: sent?.key?.id ?? null,
+      },
+      "SEND_MEDIA_SUCCESS",
+    );
+
+    return res.json({
+      ok: true,
+      id: sent?.key?.id ?? null,
+    });
+  } catch (e) {
+    log.error(
+      {
+        err: e,
+        sid: id,
+        jid,
+        type,
+        url,
+      },
+      "SEND_MEDIA_ERROR",
+    );
+
+    return res.status(500).json({
+      error: (e as Error).message,
+    });
+  }
+});
