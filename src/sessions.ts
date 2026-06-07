@@ -6,6 +6,7 @@ import {
   makeWASocket,
   fetchLatestBaileysVersion,
   DisconnectReason,
+  downloadMediaMessage,
   type WASocket,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
@@ -58,6 +59,66 @@ async function updateStatus(sessionId: string, patch: Partial<SessionState>) {
     `UPDATE sessions SET status=$2, phone=$3, profile_name=$4, updated_at=now() WHERE session_id=$1`,
     [sessionId, s.status, s.phone ?? null, s.profileName ?? null],
   );
+}
+function getIncomingMediaInfo(msg: any) {
+  const m = msg?.message ?? {};
+
+  if (m.imageMessage) {
+    return {
+      mediaType: "image",
+      mimetype: m.imageMessage.mimetype ?? "image/jpeg",
+      caption: m.imageMessage.caption ?? "",
+      fileName: null,
+      fileSize: Number(m.imageMessage.fileLength ?? 0),
+      duration: null,
+    };
+  }
+
+  if (m.videoMessage) {
+    return {
+      mediaType: "video",
+      mimetype: m.videoMessage.mimetype ?? "video/mp4",
+      caption: m.videoMessage.caption ?? "",
+      fileName: null,
+      fileSize: Number(m.videoMessage.fileLength ?? 0),
+      duration: m.videoMessage.seconds ?? null,
+    };
+  }
+
+  if (m.audioMessage) {
+    return {
+      mediaType: "audio",
+      mimetype: m.audioMessage.mimetype ?? "audio/ogg",
+      caption: "",
+      fileName: null,
+      fileSize: Number(m.audioMessage.fileLength ?? 0),
+      duration: m.audioMessage.seconds ?? null,
+    };
+  }
+
+  if (m.documentMessage) {
+    return {
+      mediaType: "document",
+      mimetype: m.documentMessage.mimetype ?? "application/octet-stream",
+      caption: m.documentMessage.caption ?? "",
+      fileName: m.documentMessage.fileName ?? "arquivo",
+      fileSize: Number(m.documentMessage.fileLength ?? 0),
+      duration: null,
+    };
+  }
+
+  if (m.stickerMessage) {
+    return {
+      mediaType: "sticker",
+      mimetype: m.stickerMessage.mimetype ?? "image/webp",
+      caption: "",
+      fileName: "sticker.webp",
+      fileSize: Number(m.stickerMessage.fileLength ?? 0),
+      duration: null,
+    };
+  }
+
+  return null;
 }
 
 async function startSession(sessionId: string): Promise<void> {
@@ -156,7 +217,7 @@ try {
       }
     });
 
-    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+   sock.ev.on("messages.upsert", async ({ messages, type }) => {
   if (type !== "notify") return;
 
   log.info(
@@ -194,14 +255,98 @@ try {
       msg.extendedTextMessage?.text ??
       msg.imageMessage?.caption ??
       msg.videoMessage?.caption ??
+      msg.documentMessage?.caption ??
       "";
 
-    const mediaType =
-      msg.imageMessage ? "image" :
-      msg.videoMessage ? "video" :
-      msg.audioMessage ? "audio" :
-      msg.documentMessage ? "document" :
-      undefined;
+    const mediaInfo = getIncomingMediaInfo(m);
+
+    if (mediaInfo) {
+      log.info(
+        {
+          sid: sessionId,
+          remoteJid: m?.key?.remoteJid,
+          mediaType: mediaInfo.mediaType,
+          mimetype: mediaInfo.mimetype,
+          fileName: mediaInfo.fileName,
+          fileSize: mediaInfo.fileSize,
+        },
+        "INCOMING_MEDIA_DETECTED",
+      );
+
+      if (!text) {
+        log.info(
+          {
+            sid: sessionId,
+            remoteJid: m?.key?.remoteJid,
+            mediaType: mediaInfo.mediaType,
+          },
+          "INCOMING_MEDIA_WITHOUT_CAPTION_ACCEPTED",
+        );
+      }
+    }
+
+    let mediaBase64: string | null = null;
+    let downloadedFileSize = mediaInfo?.fileSize ?? null;
+
+    if (mediaInfo) {
+      try {
+        log.info(
+          {
+            sid: sessionId,
+            remoteJid: m?.key?.remoteJid,
+            mediaType: mediaInfo.mediaType,
+          },
+          "INCOMING_MEDIA_DOWNLOAD_STARTED",
+        );
+
+        const buffer = await downloadMediaMessage(
+          m,
+          "buffer",
+          {},
+          {
+            logger: log.child({ sid: sessionId, mod: "media-download" }) as never,
+            reuploadRequest: sock.updateMediaMessage,
+          },
+        );
+
+        const sizeBytes = Buffer.byteLength(buffer);
+        downloadedFileSize = sizeBytes;
+
+        if (sizeBytes > 25 * 1024 * 1024) {
+          log.warn(
+            {
+              sid: sessionId,
+              remoteJid: m?.key?.remoteJid,
+              mediaType: mediaInfo.mediaType,
+              sizeBytes,
+            },
+            "INCOMING_MEDIA_TOO_LARGE",
+          );
+        } else {
+          mediaBase64 = buffer.toString("base64");
+
+          log.info(
+            {
+              sid: sessionId,
+              remoteJid: m?.key?.remoteJid,
+              mediaType: mediaInfo.mediaType,
+              sizeBytes,
+            },
+            "INCOMING_MEDIA_DOWNLOAD_SUCCESS",
+          );
+        }
+      } catch (e) {
+        log.error(
+          {
+            err: e,
+            sid: sessionId,
+            remoteJid: m?.key?.remoteJid,
+            mediaType: mediaInfo.mediaType,
+          },
+          "INCOMING_MEDIA_DOWNLOAD_ERROR",
+        );
+      }
+    }
 
     const remoteJid = m.key.remoteJid ?? null;
 
@@ -238,8 +383,49 @@ try {
       pushName: m.pushName ?? null,
       timestamp: Number(m.messageTimestamp ?? 0),
       text,
-      mediaType,
+      mediaType: mediaInfo?.mediaType ?? null,
+      mimetype: mediaInfo?.mimetype ?? null,
+      fileName: mediaInfo?.fileName ?? null,
+      fileSize: downloadedFileSize,
+      caption: mediaInfo?.caption ?? null,
+      duration: mediaInfo?.duration ?? null,
+      mediaBase64,
     });
+  }
+
+  if (!out.length) return;
+
+  log.info(
+    {
+      sid: sessionId,
+      webhookUrl: s.webhookUrl,
+      count: out.length,
+    },
+    "POST_WEBHOOK_ATTEMPT",
+  );
+
+  await postWebhook(s.webhookUrl, "messages.upsert", { messages: out });
+
+  log.info(
+    {
+      sid: sessionId,
+      webhookUrl: s.webhookUrl,
+      count: out.length,
+      hasMedia: out.some((m) => !!m.mediaType),
+    },
+    "POST_WEBHOOK_SUCCESS",
+  );
+
+  if (out.some((m) => !!m.mediaType)) {
+    log.info(
+      {
+        sid: sessionId,
+        count: out.filter((m) => !!m.mediaType).length,
+      },
+      "INCOMING_MEDIA_WEBHOOK_SENT",
+    );
+  }
+});
   }
 
   if (!out.length) return;
