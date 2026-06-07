@@ -10,8 +10,7 @@ export type IgnoreReason =
   | "NEWSLETTER_IGNORED"
   | "FROM_ME_IGNORED"
   | "EMPTY_MESSAGE_IGNORED"
-  | "NO_REMOTE_JID_IGNORED"
-  | "LID_UNMAPPED_IGNORED";
+  | "NO_REMOTE_JID_IGNORED";
 
 export function shouldIgnoreIncoming(msg: any): IgnoreReason | null {
   if (msg?.key?.fromMe) return "FROM_ME_IGNORED";
@@ -37,9 +36,22 @@ export function shouldIgnoreIncoming(msg: any): IgnoreReason | null {
     m.extendedTextMessage?.text ??
     m.imageMessage?.caption ??
     m.videoMessage?.caption ??
+    m.documentMessage?.caption ??
     "";
 
-  if (!text || !String(text).trim()) return "EMPTY_MESSAGE_IGNORED";
+  const hasText = !!String(text).trim();
+
+  const hasSupportedMedia =
+    !!m.imageMessage ||
+    !!m.videoMessage ||
+    !!m.audioMessage ||
+    !!m.documentMessage ||
+    !!m.stickerMessage;
+
+  // Só ignora se não tiver texto E também não tiver mídia suportada
+  if (!hasText && !hasSupportedMedia) {
+    return "EMPTY_MESSAGE_IGNORED";
+  }
 
   return null;
 }
