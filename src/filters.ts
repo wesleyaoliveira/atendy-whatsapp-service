@@ -12,6 +12,51 @@ export type IgnoreReason =
   | "EMPTY_MESSAGE_IGNORED"
   | "NO_REMOTE_JID_IGNORED";
 
+export function unwrapMessageContent(content: any): any {
+  let m = content ?? {};
+
+  for (let i = 0; i < 10; i++) {
+    if (m?.ephemeralMessage?.message) {
+      m = m.ephemeralMessage.message;
+      continue;
+    }
+
+    if (m?.viewOnceMessage?.message) {
+      m = m.viewOnceMessage.message;
+      continue;
+    }
+
+    if (m?.viewOnceMessageV2?.message) {
+      m = m.viewOnceMessageV2.message;
+      continue;
+    }
+
+    if (m?.viewOnceMessageV2Extension?.message) {
+      m = m.viewOnceMessageV2Extension.message;
+      continue;
+    }
+
+    if (m?.documentWithCaptionMessage?.message) {
+      m = m.documentWithCaptionMessage.message;
+      continue;
+    }
+
+    if (m?.editedMessage?.message) {
+      m = m.editedMessage.message;
+      continue;
+    }
+
+    if (m?.protocolMessage?.editedMessage) {
+      m = m.protocolMessage.editedMessage;
+      continue;
+    }
+
+    break;
+  }
+
+  return m ?? {};
+}
+
 export function shouldIgnoreIncoming(msg: any): IgnoreReason | null {
   if (msg?.key?.fromMe) return "FROM_ME_IGNORED";
 
@@ -29,7 +74,8 @@ export function shouldIgnoreIncoming(msg: any): IgnoreReason | null {
     return "NEWSLETTER_IGNORED";
   }
 
-  const m = msg?.message ?? {};
+  const raw = msg?.message ?? {};
+  const m = unwrapMessageContent(raw);
 
   const text: string =
     m.conversation ??
@@ -48,7 +94,6 @@ export function shouldIgnoreIncoming(msg: any): IgnoreReason | null {
     !!m.documentMessage ||
     !!m.stickerMessage;
 
-  // Só ignora se não tiver texto E também não tiver mídia suportada
   if (!hasText && !hasSupportedMedia) {
     return "EMPTY_MESSAGE_IGNORED";
   }
