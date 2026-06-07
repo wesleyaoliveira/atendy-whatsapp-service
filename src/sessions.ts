@@ -253,15 +253,15 @@ try {
       continue;
     }
 
-    const msg = m.message ?? {};
+    const msg = unwrapMessageContent(m.message ?? {});
 
-    const text =
-      msg.conversation ??
-      msg.extendedTextMessage?.text ??
-      msg.imageMessage?.caption ??
-      msg.videoMessage?.caption ??
-      msg.documentMessage?.caption ??
-      "";
+const text =
+  msg.conversation ??
+  msg.extendedTextMessage?.text ??
+  msg.imageMessage?.caption ??
+  msg.videoMessage?.caption ??
+  msg.documentMessage?.caption ??
+  "";
 
     const mediaInfo = getIncomingMediaInfo(m);
 
