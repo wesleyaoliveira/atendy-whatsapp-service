@@ -1,4 +1,9 @@
-import { shouldIgnoreIncoming, isGroupJid, isSupportedIndividualJid } from "./filters.js";
+import {
+  shouldIgnoreIncoming,
+  isGroupJid,
+  isSupportedIndividualJid,
+  unwrapMessageContent,
+} from "./filters.js";
 import { Router } from "express";
 import pino from "pino";
 import QRCode from "qrcode";
