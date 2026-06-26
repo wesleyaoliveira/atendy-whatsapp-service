@@ -24,7 +24,7 @@ const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 type SessionState = {
   sock?: WASocket;
   webhookUrl: string;
-  status: "pending" | "qr" | "connecting" | "connected" | "disconnected" | "error";
+  status: "pending" | "qr" | "connecting" | "connected" | "disconnected" | "needs_reconnect" | "error";
   qr?: string | null;
   phone?: string | null;
   profileName?: string | null;
@@ -66,7 +66,7 @@ async function updateStatus(sessionId: string, patch: Partial<SessionState>) {
   );
 }
 function getIncomingMediaInfo(msg: any) {
-  const m = msg?.message ?? {};
+  const m = unwrapMessageContent(msg?.message ?? msg ?? {});
 
   if (m.imageMessage) {
     return {
@@ -125,7 +125,95 @@ function getIncomingMediaInfo(msg: any) {
 
   return null;
 }
+function isDecryptSessionError(e: unknown) {
+  const msg = String((e as Error)?.message || e || "");
+  return /Bad MAC|Failed to decrypt|No matching sessions|decrypt/i.test(msg);
+}
 
+async function destroySession(sessionId: string, options: { wipeAuth?: boolean; removeDb?: boolean } = {}) {
+  const wipeAuth = options.wipeAuth ?? true;
+  const removeDb = options.removeDb ?? false;
+
+  log.info({ sid: sessionId }, "SESSION_RESET_STARTED");
+
+  const s = sessions.get(sessionId);
+
+  if (s?.sock) {
+    try {
+      log.info({ sid: sessionId }, "SESSION_LOGOUT_STARTED");
+      await s.sock.logout();
+    } catch (e) {
+      log.warn({ err: e, sid: sessionId }, "SESSION_LOGOUT_ERROR");
+    }
+
+    try {
+      s.sock.ws?.close?.();
+    } catch {
+      /* ignore */
+    }
+
+    try {
+      s.sock.end?.(undefined);
+    } catch {
+      /* ignore */
+    }
+
+    log.info({ sid: sessionId }, "SESSION_SOCKET_CLOSED");
+  }
+
+  sessions.delete(sessionId);
+  log.info({ sid: sessionId }, "SESSION_MEMORY_REMOVED");
+
+  if (wipeAuth) {
+    try {
+      log.info({ sid: sessionId }, "SESSION_AUTH_CLEANUP_STARTED");
+      await deleteAllAuth(sessionId);
+      log.info({ sid: sessionId }, "SESSION_AUTH_CLEANUP_SUCCESS");
+    } catch (e) {
+      log.error({ err: e, sid: sessionId }, "SESSION_AUTH_CLEANUP_ERROR");
+    }
+  }
+
+  if (removeDb) {
+    await pool.query("DELETE FROM sessions WHERE session_id=$1", [sessionId]);
+  } else {
+    await pool.query(
+      "UPDATE sessions SET status='disconnected', phone=NULL, profile_name=NULL, updated_at=now() WHERE session_id=$1",
+      [sessionId],
+    );
+  }
+
+  log.info({ sid: sessionId }, "SESSION_RESET_SUCCESS");
+
+  return { ok: true };
+}
+
+async function markSessionNeedsReconnect(sessionId: string, webhookUrl?: string) {
+  const s = sessions.get(sessionId);
+
+  if (s) {
+    s.status = "needs_reconnect";
+    s.qr = null;
+  }
+
+  await pool.query(
+    "UPDATE sessions SET status='needs_reconnect', updated_at=now() WHERE session_id=$1",
+    [sessionId],
+  );
+
+  log.warn({ sid: sessionId }, "SESSION_MARKED_NEEDS_RECONNECT");
+
+  if (webhookUrl) {
+    try {
+      await postWebhook(webhookUrl, "connection.update", {
+        status: "needs_reconnect",
+        reason: "decrypt_bad_mac",
+      });
+    } catch (e) {
+      log.warn({ err: e, sid: sessionId }, "NEEDS_RECONNECT_WEBHOOK_ERROR");
+    }
+  }
+}
 async function startSession(sessionId: string): Promise<void> {
   const s = sessions.get(sessionId);
   if (!s) throw new Error("session missing");
@@ -223,239 +311,252 @@ try {
     });
 
    sock.ev.on("messages.upsert", async ({ messages, type }) => {
-  if (type !== "notify") return;
+  try {
+    if (type !== "notify") return;
 
-  log.info(
-    {
-      sid: sessionId,
-      count: messages?.length ?? 0,
-      type,
-    },
-    "MESSAGES_UPSERT_RECEIVED",
-  );
+    log.info(
+      {
+        sid: sessionId,
+        count: messages?.length ?? 0,
+        type,
+      },
+      "MESSAGES_UPSERT_RECEIVED",
+    );
 
-  const out = [];
+    const out = [];
 
-  for (const m of messages ?? []) {
-    const reason = shouldIgnoreIncoming(m);
+    for (const m of messages ?? []) {
+      const reason = shouldIgnoreIncoming(m);
 
-    if (reason) {
-      log.info(
-        {
-          sid: sessionId,
+      if (reason) {
+        log.info(
+          {
+            sid: sessionId,
+            reason,
+            remoteJid: m?.key?.remoteJid,
+            fromMe: m?.key?.fromMe,
+            pushName: m?.pushName,
+          },
           reason,
-          remoteJid: m?.key?.remoteJid,
-          fromMe: m?.key?.fromMe,
-          pushName: m?.pushName,
-        },
-        reason,
-      );
-      continue;
-    }
-
-    const msg = unwrapMessageContent(m.message ?? {});
-
-const text =
-  msg.conversation ??
-  msg.extendedTextMessage?.text ??
-  msg.imageMessage?.caption ??
-  msg.videoMessage?.caption ??
-  msg.documentMessage?.caption ??
-  "";
-
-    const mediaInfo = getIncomingMediaInfo(m);
-
-    if (mediaInfo) {
-      log.info(
-        {
-          sid: sessionId,
-          remoteJid: m?.key?.remoteJid,
-          mediaType: mediaInfo.mediaType,
-          mimetype: mediaInfo.mimetype,
-          fileName: mediaInfo.fileName,
-          fileSize: mediaInfo.fileSize,
-        },
-        "INCOMING_MEDIA_DETECTED",
-      );
-
-      if (!text) {
-        log.info(
-          {
-            sid: sessionId,
-            remoteJid: m?.key?.remoteJid,
-            mediaType: mediaInfo.mediaType,
-          },
-          "INCOMING_MEDIA_WITHOUT_CAPTION_ACCEPTED",
         );
+        continue;
       }
-    }
 
-    let mediaBase64: string | null = null;
-    let downloadedFileSize = mediaInfo?.fileSize ?? null;
+      const msg = unwrapMessageContent(m.message ?? {});
 
-    if (mediaInfo) {
-      try {
+      const text =
+        msg.conversation ??
+        msg.extendedTextMessage?.text ??
+        msg.imageMessage?.caption ??
+        msg.videoMessage?.caption ??
+        msg.documentMessage?.caption ??
+        "";
+
+      const mediaInfo = getIncomingMediaInfo(m);
+
+      if (mediaInfo) {
         log.info(
           {
             sid: sessionId,
             remoteJid: m?.key?.remoteJid,
             mediaType: mediaInfo.mediaType,
+            mimetype: mediaInfo.mimetype,
+            fileName: mediaInfo.fileName,
+            fileSize: mediaInfo.fileSize,
           },
-          "INCOMING_MEDIA_DOWNLOAD_STARTED",
+          "INCOMING_MEDIA_DETECTED",
         );
 
-        const buffer = await downloadMediaMessage(
-          m,
-          "buffer",
-          {},
-          {
-            logger: log.child({ sid: sessionId, mod: "media-download" }) as never,
-            reuploadRequest: sock.updateMediaMessage,
-          },
-        );
-
-        const sizeBytes = Buffer.byteLength(buffer);
-        downloadedFileSize = sizeBytes;
-
-        if (sizeBytes > 25 * 1024 * 1024) {
-          log.warn(
-            {
-              sid: sessionId,
-              remoteJid: m?.key?.remoteJid,
-              mediaType: mediaInfo.mediaType,
-              sizeBytes,
-            },
-            "INCOMING_MEDIA_TOO_LARGE",
-          );
-        } else {
-          mediaBase64 = buffer.toString("base64");
-
+        if (!text) {
           log.info(
             {
               sid: sessionId,
               remoteJid: m?.key?.remoteJid,
               mediaType: mediaInfo.mediaType,
-              sizeBytes,
             },
-            "INCOMING_MEDIA_DOWNLOAD_SUCCESS",
+            "INCOMING_MEDIA_WITHOUT_CAPTION_ACCEPTED",
           );
         }
-      } catch (e) {
-        log.error(
-          {
-            err: e,
-            sid: sessionId,
-            remoteJid: m?.key?.remoteJid,
-            mediaType: mediaInfo.mediaType,
-          },
-          "INCOMING_MEDIA_DOWNLOAD_ERROR",
-        );
       }
+
+      let mediaBase64: string | null = null;
+      let downloadedFileSize = mediaInfo?.fileSize ?? null;
+
+      if (mediaInfo) {
+        try {
+          log.info(
+            {
+              sid: sessionId,
+              remoteJid: m?.key?.remoteJid,
+              mediaType: mediaInfo.mediaType,
+            },
+            "INCOMING_MEDIA_DOWNLOAD_STARTED",
+          );
+
+          const buffer = await downloadMediaMessage(
+            m,
+            "buffer",
+            {},
+            {
+              logger: log.child({ sid: sessionId, mod: "media-download" }) as never,
+              reuploadRequest: sock.updateMediaMessage,
+            },
+          );
+
+          const sizeBytes = Buffer.byteLength(buffer);
+          downloadedFileSize = sizeBytes;
+
+          if (sizeBytes > 25 * 1024 * 1024) {
+            log.warn(
+              {
+                sid: sessionId,
+                remoteJid: m?.key?.remoteJid,
+                mediaType: mediaInfo.mediaType,
+                sizeBytes,
+              },
+              "INCOMING_MEDIA_TOO_LARGE",
+            );
+          } else {
+            mediaBase64 = buffer.toString("base64");
+
+            log.info(
+              {
+                sid: sessionId,
+                remoteJid: m?.key?.remoteJid,
+                mediaType: mediaInfo.mediaType,
+                sizeBytes,
+              },
+              "INCOMING_MEDIA_DOWNLOAD_SUCCESS",
+            );
+          }
+        } catch (e) {
+          if (isDecryptSessionError(e)) {
+            log.error(
+              {
+                err: e,
+                sid: sessionId,
+                remoteJid: m?.key?.remoteJid,
+              },
+              "WHATSAPP_DECRYPT_BAD_MAC_DETECTED",
+            );
+
+            await markSessionNeedsReconnect(sessionId, s.webhookUrl);
+            return;
+          }
+
+          log.error(
+            {
+              err: e,
+              sid: sessionId,
+              remoteJid: m?.key?.remoteJid,
+              mediaType: mediaInfo.mediaType,
+            },
+            "INCOMING_MEDIA_DOWNLOAD_ERROR",
+          );
+        }
+      }
+
+      const remoteJid = m.key.remoteJid ?? null;
+
+      const remoteJidAlt =
+        (m.key as any)?.remoteJidAlt ??
+        (m as any)?.remoteJidAlt ??
+        null;
+
+      const senderPn =
+        (m.key as any)?.senderPn ??
+        (m.key as any)?.participantPn ??
+        (m as any)?.senderPn ??
+        null;
+
+      const participant =
+        m.key.participant ??
+        (m.key as any)?.participant ??
+        null;
+
+      const addressingMode =
+        (m.key as any)?.addressingMode ??
+        (m as any)?.addressingMode ??
+        null;
+
+      out.push({
+        id: m.key.id,
+        from: remoteJid,
+        remoteJid,
+        remoteJidAlt,
+        senderPn,
+        participant,
+        addressingMode,
+        fromMe: m.key.fromMe ?? false,
+        pushName: m.pushName ?? null,
+        timestamp: Number(m.messageTimestamp ?? 0),
+        text,
+        mediaType: mediaInfo?.mediaType ?? null,
+        mimetype: mediaInfo?.mimetype ?? null,
+        fileName: mediaInfo?.fileName ?? null,
+        fileSize: downloadedFileSize,
+        caption: mediaInfo?.caption ?? null,
+        duration: mediaInfo?.duration ?? null,
+        mediaBase64,
+      });
     }
 
-    const remoteJid = m.key.remoteJid ?? null;
+    if (!out.length) return;
 
-    const remoteJidAlt =
-      (m.key as any)?.remoteJidAlt ??
-      (m as any)?.remoteJidAlt ??
-      null;
-
-    const senderPn =
-      (m.key as any)?.senderPn ??
-      (m.key as any)?.participantPn ??
-      (m as any)?.senderPn ??
-      null;
-
-    const participant =
-      m.key.participant ??
-      (m.key as any)?.participant ??
-      null;
-
-    const addressingMode =
-      (m.key as any)?.addressingMode ??
-      (m as any)?.addressingMode ??
-      null;
-
-    out.push({
-      id: m.key.id,
-      from: remoteJid,
-      remoteJid,
-      remoteJidAlt,
-      senderPn,
-      participant,
-      addressingMode,
-      fromMe: m.key.fromMe ?? false,
-      pushName: m.pushName ?? null,
-      timestamp: Number(m.messageTimestamp ?? 0),
-      text,
-      mediaType: mediaInfo?.mediaType ?? null,
-      mimetype: mediaInfo?.mimetype ?? null,
-      fileName: mediaInfo?.fileName ?? null,
-      fileSize: downloadedFileSize,
-      caption: mediaInfo?.caption ?? null,
-      duration: mediaInfo?.duration ?? null,
-      mediaBase64,
-    });
-  }
-
-  if (!out.length) return;
-
-  log.info(
-    {
-      sid: sessionId,
-      webhookUrl: s.webhookUrl,
-      count: out.length,
-    },
-    "POST_WEBHOOK_ATTEMPT",
-  );
-
-  await postWebhook(s.webhookUrl, "messages.upsert", { messages: out });
-
-  log.info(
-    {
-      sid: sessionId,
-      webhookUrl: s.webhookUrl,
-      count: out.length,
-      hasMedia: out.some((m) => !!m.mediaType),
-    },
-    "POST_WEBHOOK_SUCCESS",
-  );
-
-  if (out.some((m) => !!m.mediaType)) {
     log.info(
       {
         sid: sessionId,
-        count: out.filter((m) => !!m.mediaType).length,
+        webhookUrl: s.webhookUrl,
+        count: out.length,
       },
-      "INCOMING_MEDIA_WEBHOOK_SENT",
+      "POST_WEBHOOK_ATTEMPT",
+    );
+
+    await postWebhook(s.webhookUrl, "messages.upsert", { messages: out });
+
+    log.info(
+      {
+        sid: sessionId,
+        webhookUrl: s.webhookUrl,
+        count: out.length,
+        hasMedia: out.some((m) => !!m.mediaType),
+      },
+      "POST_WEBHOOK_SUCCESS",
+    );
+
+    if (out.some((m) => !!m.mediaType)) {
+      log.info(
+        {
+          sid: sessionId,
+          count: out.filter((m) => !!m.mediaType).length,
+        },
+        "INCOMING_MEDIA_WEBHOOK_SENT",
+      );
+    }
+  } catch (e) {
+    if (isDecryptSessionError(e)) {
+      log.error(
+        {
+          err: e,
+          sid: sessionId,
+        },
+        "WHATSAPP_DECRYPT_BAD_MAC_DETECTED",
+      );
+
+      await markSessionNeedsReconnect(sessionId, s.webhookUrl);
+      return;
+    }
+
+    log.error(
+      {
+        err: e,
+        sid: sessionId,
+      },
+      "MESSAGES_UPSERT_ERROR",
     );
   }
 });
-  }
-
-  if (!out.length) return;
-
-  log.info(
-    {
-      sid: sessionId,
-      webhookUrl: s.webhookUrl,
-      count: out.length,
-    },
-    "POST_WEBHOOK_ATTEMPT",
-  );
-
-  await postWebhook(s.webhookUrl, "messages.upsert", { messages: out });
-
-  log.info(
-    {
-      sid: sessionId,
-      webhookUrl: s.webhookUrl,
-      count: out.length,
-    },
-    "POST_WEBHOOK_SUCCESS",
-  );
-});
-  } finally {
+   } finally {
     s.starting = false;
   }
 }
@@ -518,17 +619,51 @@ sessionsRouter.post("/:id/restart", async (req, res) => {
   res.json(snap(id));
 });
 
+// POST /sessions/:id/reset
+sessionsRouter.post("/:id/reset", async (req, res) => {
+  const id = req.params.id;
+
+  try {
+    await destroySession(id, { wipeAuth: true, removeDb: false });
+
+    const s = sessions.get(id);
+
+    if (!s) {
+      return res.json({ ok: true, status: "disconnected" });
+    }
+
+    return res.json(snap(id));
+  } catch (e) {
+    log.error({ err: e, sid: id }, "SESSION_RESET_ERROR");
+
+    return res.status(500).json({
+      ok: false,
+      error: (e as Error).message,
+    });
+  }
+});
+
 // DELETE /sessions/:id
 sessionsRouter.delete("/:id", async (req, res) => {
   const id = req.params.id;
   const s = sessions.get(id);
-  try { await s?.sock?.logout(); } catch { /* noop */ }
-  try { s?.sock?.end(undefined); } catch { /* noop */ }
-  sessions.delete(id);
-  await deleteAllAuth(id);
-  await pool.query("DELETE FROM sessions WHERE session_id=$1", [id]);
-  if (s) await postWebhook(s.webhookUrl, "session.deleted", {});
-  res.json({ ok: true });
+
+  try {
+    await destroySession(id, { wipeAuth: true, removeDb: true });
+
+    if (s?.webhookUrl) {
+      await postWebhook(s.webhookUrl, "session.deleted", {});
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error({ err: e, sid: id }, "SESSION_DELETE_ERROR");
+
+    return res.status(500).json({
+      ok: false,
+      error: (e as Error).message,
+    });
+  }
 });
 
 // POST /sessions/:id/send  { to, text }
