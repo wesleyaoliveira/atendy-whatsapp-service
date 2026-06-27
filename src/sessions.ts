@@ -778,7 +778,7 @@ sessionsRouter.post("/:id/send", async (req, res) => {
 // POST /sessions/:id/send-media  { to, type, url, caption, fileName, mimetype }
 sessionsRouter.post("/:id/send-media", async (req, res) => {
   const id = req.params.id;
-  const { to, type, url, caption, fileName, mimetype } = req.body ?? {};
+  const { to, type, url, caption, fileName, mimetype, ptt } = req.body ?? {};
 
   if (typeof to !== "string" || typeof type !== "string" || typeof url !== "string") {
     return res.status(400).json({
@@ -788,18 +788,19 @@ sessionsRouter.post("/:id/send-media", async (req, res) => {
 
   const s = sessions.get(id);
 
-  log.info(
-    {
-      sid: id,
-      status: s?.status,
-      to,
-      type,
-      url,
-      mimetype,
-      fileName,
-    },
-    "SEND_MEDIA_REQUEST_RECEIVED",
-  );
+log.info(
+  {
+    sid: id,
+    status: s?.status,
+    to,
+    type,
+    url,
+    mimetype,
+    fileName,
+    ptt,
+  },
+  "SEND_MEDIA_REQUEST_RECEIVED",
+);
 
   if (!s?.sock || s.status !== "connected") {
     return res.status(409).json({
@@ -869,12 +870,27 @@ sessionsRouter.post("/:id/send-media", async (req, res) => {
     }
 
     if (mediaType === "audio") {
-      payload = {
-        audio: { url },
-        mimetype: mimetype || "audio/mpeg",
-        ptt: false,
-      };
-    }
+  const isVoiceNote = Boolean(ptt);
+
+  log.info(
+    {
+      sid: id,
+      jid,
+      url,
+      mimetype,
+      ptt: isVoiceNote,
+    },
+    "SEND_AUDIO_ATTEMPT",
+  );
+
+  payload = {
+    audio: { url },
+    mimetype: isVoiceNote
+      ? mimetype || "audio/ogg; codecs=opus"
+      : mimetype || "audio/mpeg",
+    ptt: isVoiceNote,
+  };
+}
 
     if (mediaType === "document") {
       payload = {
@@ -887,6 +903,17 @@ sessionsRouter.post("/:id/send-media", async (req, res) => {
 
     const sent = await s.sock.sendMessage(jid, payload);
 
+if (mediaType === "audio") {
+  log.info(
+    {
+      sid: id,
+      jid,
+      messageId: sent?.key?.id ?? null,
+    },
+    "SEND_AUDIO_SUCCESS",
+  );
+}
+    
     log.info(
       {
         sid: id,
@@ -902,6 +929,20 @@ sessionsRouter.post("/:id/send-media", async (req, res) => {
       id: sent?.key?.id ?? null,
     });
   } catch (e) {
+    if (type === "audio") {
+  log.error(
+    {
+      err: e,
+      sid: id,
+      jid,
+      url,
+      mimetype,
+      ptt,
+    },
+    "SEND_AUDIO_ERROR",
+  );
+}
+    
     log.error(
       {
         err: e,
