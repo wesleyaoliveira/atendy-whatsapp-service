@@ -34,7 +34,7 @@ type SessionState = {
 };
 
 const sessions = new Map<string, SessionState>();
-
+const manuallyStoppedSessions = new Set<string>();
 function snap(sessionId: string) {
   const s = sessions.get(sessionId);
   if (!s) return null;
@@ -131,6 +131,9 @@ function isDecryptSessionError(e: unknown) {
 }
 
 async function destroySession(sessionId: string, options: { wipeAuth?: boolean; removeDb?: boolean } = {}) {
+manuallyStoppedSessions.add(sessionId);
+log.info({ sid: sessionId }, "SESSION_MANUAL_STOP_REGISTERED");
+  
   const wipeAuth = options.wipeAuth ?? true;
   const removeDb = options.removeDb ?? false;
 
@@ -217,6 +220,12 @@ async function markSessionNeedsReconnect(sessionId: string, webhookUrl?: string)
 async function startSession(sessionId: string): Promise<void> {
   const s = sessions.get(sessionId);
   if (!s) throw new Error("session missing");
+
+  if (manuallyStoppedSessions.has(sessionId)) {
+    log.info({ sid: sessionId }, "SESSION_RECONNECT_SKIPPED_MANUAL_STOP");
+    return;
+  }
+
   if (s.starting) return;
   s.starting = true;
 
@@ -287,11 +296,16 @@ try {
       }
 
       if (connection === "close") {
-        const code = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
-        const loggedOut = code === DisconnectReason.loggedOut;
-        s.sock = undefined;
+  const code = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
+  const loggedOut = code === DisconnectReason.loggedOut;
+  s.sock = undefined;
 
-        if (loggedOut) {
+  if (manuallyStoppedSessions.has(sessionId)) {
+    log.info({ sid: sessionId }, "SESSION_RECONNECT_SKIPPED_MANUAL_STOP");
+    return;
+  }
+
+  if (loggedOut) {
           await deleteAllAuth(sessionId);
           await updateStatus(sessionId, { status: "disconnected", qr: null, phone: null, profileName: null });
           await postWebhook(s.webhookUrl, "connection.update", { status: "logged_out" });
@@ -581,9 +595,15 @@ export const sessionsRouter = Router();
 // POST /sessions  { sessionId, webhookUrl }
 sessionsRouter.post("/", async (req, res) => {
   const { sessionId, webhookUrl } = req.body ?? {};
+  
   if (typeof sessionId !== "string" || typeof webhookUrl !== "string") {
     return res.status(400).json({ error: "sessionId and webhookUrl required" });
   }
+  
+  if (manuallyStoppedSessions.delete(sessionId)) {
+  log.info({ sid: sessionId }, "SESSION_MANUAL_STOP_CLEARED_ON_NEW_CONNECT");
+}
+  
   await persistSession(sessionId, webhookUrl);
   let s = sessions.get(sessionId);
   if (!s) {
@@ -610,8 +630,14 @@ sessionsRouter.get("/:id", (req, res) => {
 // POST /sessions/:id/restart
 sessionsRouter.post("/:id/restart", async (req, res) => {
   const id = req.params.id;
+  
+if (manuallyStoppedSessions.delete(id)) {
+  log.info({ sid: id }, "SESSION_MANUAL_STOP_CLEARED_ON_RESTART");
+}
+  
   const s = sessions.get(id);
   if (!s) return res.status(404).json({ error: "not found" });
+  
   try { s.sock?.end(undefined); } catch { /* noop */ }
   s.sock = undefined;
   s.retries = 0;
