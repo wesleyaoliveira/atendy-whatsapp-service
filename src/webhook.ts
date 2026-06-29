@@ -9,13 +9,14 @@ export async function postWebhook(webhookUrl: string, event: string, data: any) 
     data,
   };
 
-  const res = await fetch(webhookUrl, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
+ const res = await fetch(webhookUrl, {
+  method: "POST",
+  headers: {
+    "content-type": "application/json",
+    Authorization: `Bearer ${TOKEN()}`,
+  },
+  body: JSON.stringify(payload),
+});
 
   if (!res.ok) {
     const responseBody = await res.text().catch(() => "");
